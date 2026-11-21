@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import List, Optional
 import numpy as np
 from PIL import Image, ImageOps
@@ -286,9 +287,68 @@ class OCRWorker(QThread):
     def cancel(self) -> None:
         self._is_cancelled = True
 
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Chuẩn hóa nhẹ chuỗi để so khớp trùng lặp giữa 2 ảnh chụp chồng lấn."""
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+    @classmethod
+    def _is_similar(cls, a: str, b: str, threshold: float = 0.85) -> bool:
+        na = cls._normalize_for_match(a)
+        nb = cls._normalize_for_match(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        return SequenceMatcher(None, na, nb).ratio() >= threshold
+
+    @classmethod
+    def _deduplicate_overlap(cls, prev_text: str, curr_text: str) -> tuple[str, str]:
+        """
+        Loại bỏ các dòng trùng lặp ở phần giao giữa cuối ảnh trước và đầu ảnh sau
+        khi người dùng chụp cuộn trang có chồng lấn.
+        Trả về (prev_text_đã_cập_nhật, curr_text_sau_khi_bỏ_phần_trùng).
+        """
+        prev_lines = [line.strip() for line in prev_text.splitlines() if line.strip()]
+        curr_lines = [line.strip() for line in curr_text.splitlines() if line.strip()]
+        if not prev_lines or not curr_lines:
+            return prev_text, curr_text
+
+        max_overlap = min(8, len(prev_lines), len(curr_lines))
+        for k in range(max_overlap, 0, -1):
+            exact_prefix_match = all(
+                cls._is_similar(prev_lines[-k + i], curr_lines[i])
+                for i in range(k - 1)
+            )
+            if not exact_prefix_match:
+                continue
+
+            last_prev = prev_lines[-1]
+            last_curr = curr_lines[k - 1]
+            if cls._is_similar(last_prev, last_curr):
+                return prev_text, "\n".join(curr_lines[k:])
+
+            # Cho phép dòng cuối của phần giao bị cắt dở ở ảnh trước và đầy đủ hơn ở ảnh sau
+            n_prev = cls._normalize_for_match(last_prev)
+            n_curr = cls._normalize_for_match(last_curr)
+            if len(n_prev) >= 10 and len(n_curr) >= len(n_prev):
+                if SequenceMatcher(None, n_prev, n_curr[: len(n_prev)]).ratio() >= 0.85:
+                    prev_lines[-1] = last_curr
+                    return "\n".join(prev_lines), "\n".join(curr_lines[k:])
+
+        # Trường hợp 1 dòng cuối ảnh trước chứa trọn 1 dòng đầu ảnh sau
+        n_prev = cls._normalize_for_match(prev_lines[-1])
+        n_curr = cls._normalize_for_match(curr_lines[0])
+        if len(n_curr) >= 15 and len(n_prev) >= len(n_curr):
+            suffix_of_prev = n_prev[-len(n_curr) :]
+            if SequenceMatcher(None, suffix_of_prev, n_curr).ratio() >= 0.85:
+                return prev_text, "\n".join(curr_lines[1:])
+
+        return prev_text, curr_text
+
     @classmethod
     def _join_page_texts(cls, page_texts: List[str]) -> str:
-        """Ghép văn bản giữa các ảnh liên tiếp, nối tiếp câu nếu ảnh trước bị cắt ngang."""
+        """Ghép văn bản giữa các ảnh liên tiếp, tự động lọc trùng lặp và nối câu cắt ngang."""
         merged: List[str] = []
         for text in page_texts:
             cleaned = text.strip()
@@ -298,15 +358,21 @@ class OCRWorker(QThread):
                 merged.append(cleaned)
                 continue
 
+            updated_prev, dedup_curr = cls._deduplicate_overlap(merged[-1], cleaned)
+            merged[-1] = updated_prev
+            dedup_curr = dedup_curr.strip()
+            if not dedup_curr:
+                continue
+
             prev = merged[-1].rstrip()
-            first_line = cleaned.splitlines()[0].lstrip()
+            first_line = dedup_curr.splitlines()[0].lstrip()
             if (
                 not prev.endswith(OCREngine.SENTENCE_ENDINGS)
                 and not first_line.startswith(OCREngine.DIALOGUE_PREFIXES)
             ):
-                merged[-1] = f"{prev} {cleaned}"
+                merged[-1] = f"{prev} {dedup_curr}"
             else:
-                merged.append(cleaned)
+                merged.append(dedup_curr)
         return "\n\n".join(merged)
 
     def run(self) -> None:
