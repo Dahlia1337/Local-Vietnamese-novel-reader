@@ -1,5 +1,6 @@
-temp_audio
-_pycache_
-.venv
-library_data
-img_test
+temp_audio/
+__pycache__/
+.venv/
+models/
+library_data/
+img_test/
